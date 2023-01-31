@@ -17,15 +17,15 @@ from typing import Any, Dict, List, Optional, Union
 
 from packaging import version
 
-from .debug_utils import DebugOption
-from .trainer_utils import (
+from transformers.debug_utils import DebugOption
+from transformers.trainer_utils import (
     FSDPOption,
     HubStrategy,
     IntervalStrategy,
     SchedulerType,
     ShardedDDPOption,
 )
-from .utils import (
+from transformers.utils import (
     ExplicitEnum,
     cached_property,
     ccl_version,
@@ -1090,7 +1090,7 @@ class TrainingArguments:
             self.report_to = "all"
         if self.report_to == "all" or self.report_to == ["all"]:
             # Import at runtime to avoid a circular import.
-            from .integrations import get_available_reporting_integrations
+            from transformers.integrations import get_available_reporting_integrations
 
             self.report_to = get_available_reporting_integrations()
         elif self.report_to == "none" or self.report_to == ["none"]:
@@ -1266,7 +1266,7 @@ class TrainingArguments:
                 )
         elif self.deepspeed:
             # deepspeed inits torch.distributed internally
-            from .deepspeed import is_deepspeed_available
+            from transformers.deepspeed import is_deepspeed_available
 
             if not is_deepspeed_available():
                 raise ImportError("--deepspeed requires deepspeed: `pip install deepspeed`.")

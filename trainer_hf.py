@@ -37,7 +37,7 @@ from tqdm.auto import tqdm
 
 
 # Integrations must be imported before ML frameworks:
-from .integrations import (  # isort: split
+from transformers.integrations import (  # isort: split
     default_hp_search_backend,
     get_reporting_integration_callbacks,
     hp_params,
@@ -60,17 +60,17 @@ from torch import nn
 from torch.utils.data import DataLoader, Dataset, RandomSampler, SequentialSampler
 from torch.utils.data.distributed import DistributedSampler
 
-from . import __version__
-from .configuration_utils import PretrainedConfig
-from .data.data_collator import DataCollator, DataCollatorWithPadding, default_data_collator
-from .deepspeed import deepspeed_init, is_deepspeed_zero3_enabled
-from .dependency_versions_check import dep_version_check
-from .modeling_utils import PreTrainedModel, load_sharded_checkpoint, unwrap_model
-from .models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES, MODEL_MAPPING_NAMES
-from .optimization import Adafactor, get_scheduler
-from .pytorch_utils import ALL_LAYERNORM_LAYERS, is_torch_greater_or_equal_than_1_10, is_torch_less_than_1_11
-from .tokenization_utils_base import PreTrainedTokenizerBase
-from .trainer_callback import (
+from transformers import __version__
+from transformers.configuration_utils import PretrainedConfig
+from transformers.data.data_collator import DataCollator, DataCollatorWithPadding, default_data_collator
+from transformers.deepspeed import deepspeed_init, is_deepspeed_zero3_enabled
+from transformers.dependency_versions_check import dep_version_check
+from transformers.modeling_utils import PreTrainedModel, load_sharded_checkpoint, unwrap_model
+from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES, MODEL_MAPPING_NAMES
+from transformers.optimization import Adafactor, get_scheduler
+from transformers.pytorch_utils import ALL_LAYERNORM_LAYERS, is_torch_greater_or_equal_than_1_10, is_torch_less_than_1_11
+from transformers.tokenization_utils_base import PreTrainedTokenizerBase
+from transformers.trainer_callback import (
     CallbackHandler,
     DefaultFlowCallback,
     PrinterCallback,
@@ -79,7 +79,7 @@ from .trainer_callback import (
     TrainerControl,
     TrainerState,
 )
-from .trainer_pt_utils import (
+from transformers.trainer_pt_utils import (
     DistributedLengthGroupedSampler,
     DistributedSamplerWithLoop,
     IterableDatasetShard,
@@ -96,7 +96,7 @@ from .trainer_pt_utils import (
     nested_truncate,
     reissue_pt_warnings,
 )
-from .trainer_utils import (
+from transformers.trainer_utils import (
     PREFIX_CHECKPOINT_DIR,
     BestRun,
     EvalLoopOutput,
@@ -120,8 +120,8 @@ from .trainer_utils import (
     set_seed,
     speed_metrics,
 )
-from .training_args import OptimizerNames, ParallelMode, TrainingArguments
-from .utils import (
+from training_args import OptimizerNames, TrainingArguments
+from transformers.utils import (
     CONFIG_NAME,
     WEIGHTS_INDEX_NAME,
     WEIGHTS_NAME,
@@ -132,7 +132,7 @@ from .utils import (
     is_torch_compile_available,
     logging,
 )
-from .utils.generic import ContextManagers
+from transformers.utils.generic import ContextManagers
 
 
 _is_native_cpu_amp_available = is_torch_greater_or_equal_than_1_10
@@ -256,7 +256,7 @@ class Trainer:
 
     """
 
-    from .trainer_pt_utils import _get_learning_rate, log_metrics, metrics_format, save_metrics, save_state
+    from transformers.trainer_pt_utils import _get_learning_rate, log_metrics, metrics_format, save_metrics, save_state
 
     def __init__(
         self,
@@ -514,12 +514,11 @@ class Trainer:
                         )
 
                         self.scaler = FSDPShardedGradScaler()
+                    # fsdp不支持bfloat16?
                     else:
                         self.do_grad_scaling = False
                         self.use_cuda_amp = False
                         self.amp_dtype = None
-
-                    self.scaler = GradScaler()
                 else:
                     self.scaler = torch.cuda.amp.GradScaler()
             elif args.half_precision_backend == "cpu_amp":
@@ -608,6 +607,7 @@ class Trainer:
         model = model.to(device)
 
     def _set_signature_columns_if_needed(self):
+        """get model forward arguments it accepts"""
         if self._signature_columns is None:
             # Inspect model forward signature to keep only the arguments it accepts.
             signature = inspect.signature(self.model.forward)
@@ -631,15 +631,7 @@ class Trainer:
                 " you can safely ignore this message."
             )
 
-        columns = [k for k in signature_columns if k in dataset.column_names]
-
-        if version.parse(datasets.__version__) < version.parse("1.4.0"):
-            dataset.set_format(
-                type=dataset.format["type"], columns=columns, format_kwargs=dataset.format["format_kwargs"]
-            )
-            return dataset
-        else:
-            return dataset.remove_columns(ignored_columns)
+        return dataset.remove_columns(ignored_columns)
 
     def _get_collator_with_removed_columns(
         self, data_collator: Callable, description: Optional[str] = None
@@ -650,6 +642,7 @@ class Trainer:
         self._set_signature_columns_if_needed()
         signature_columns = self._signature_columns
 
+        # RemoveColumnsCollator的作用是什么？
         remove_columns_collator = RemoveColumnsCollator(
             data_collator=data_collator,
             signature_columns=signature_columns,
@@ -688,9 +681,10 @@ class Trainer:
             else:
                 lengths = None
             model_input_name = self.tokenizer.model_input_names[0] if self.tokenizer is not None else None
+            batch_size = self.args.train_batch_size * self.args.gradient_accumulation_steps
             if self.args.world_size <= 1:
                 return LengthGroupedSampler(
-                    self.args.train_batch_size * self.args.gradient_accumulation_steps,
+                    batch_size,
                     dataset=self.train_dataset,
                     lengths=lengths,
                     model_input_name=model_input_name,
@@ -698,7 +692,7 @@ class Trainer:
                 )
             else:
                 return DistributedLengthGroupedSampler(
-                    self.args.train_batch_size * self.args.gradient_accumulation_steps,
+                    batch_size,
                     dataset=self.train_dataset,
                     num_replicas=self.args.world_size,
                     rank=self.args.process_index,
@@ -710,18 +704,6 @@ class Trainer:
         else:
             if self.args.world_size <= 1:
                 return RandomSampler(self.train_dataset, generator=generator)
-            elif (
-                self.args.parallel_mode in [ParallelMode.TPU, ParallelMode.SAGEMAKER_MODEL_PARALLEL]
-                and not self.args.dataloader_drop_last
-            ):
-                # Use a loop for TPUs when drop_last is False to have all batches have the same size.
-                return DistributedSamplerWithLoop(
-                    self.train_dataset,
-                    batch_size=self.args.per_device_train_batch_size,
-                    num_replicas=self.args.world_size,
-                    rank=self.args.process_index,
-                    seed=seed,
-                )
             else:
                 return DistributedSampler(
                     self.train_dataset,
@@ -887,8 +869,7 @@ class Trainer:
         `create_scheduler`) in a subclass.
         """
         self.create_optimizer()
-        optimizer = self.optimizer
-        self.create_scheduler(num_training_steps=num_training_steps, optimizer=optimizer)
+        self.create_scheduler(num_training_steps=num_training_steps, optimizer=self.optimizer)
 
     def create_optimizer(self):
         """
@@ -967,7 +948,7 @@ class Trainer:
             optimizer_cls = Adafactor
             optimizer_kwargs.update({"scale_parameter": False, "relative_step": False})
         elif args.optim == OptimizerNames.ADAMW_HF:
-            from .optimization import AdamW
+            from transformers.optimization import AdamW
 
             optimizer_cls = AdamW
             optimizer_kwargs.update(adam_kwargs)
@@ -1370,18 +1351,13 @@ class Trainer:
             trial=trial,
             ignore_keys_for_eval=ignore_keys_for_eval,
         )
-
-    def _inner_training_loop(
-        self, batch_size=None, args=None, resume_from_checkpoint=None, trial=None, ignore_keys_for_eval=None
-    ):
-        self._train_batch_size = batch_size
-        # Data loader and number of training steps
-        train_dataloader = self.get_train_dataloader()
-
+    
+    def _training_control_variables(self, args, train_dataloader):
         # Setting up training control variables:
         # number of training epochs: num_train_epochs
         # number of training steps per epoch: num_update_steps_per_epoch
         # total number of training steps to execute: max_steps
+        result = {}
         total_train_batch_size = args.train_batch_size * args.gradient_accumulation_steps * args.world_size
 
         len_dataloader = None
@@ -1414,6 +1390,65 @@ class Trainer:
                 "args.max_steps must be set to a positive value if dataloader does not have a length, was"
                 f" {args.max_steps}"
             )
+        result = {
+            "total_train_batch_size": total_train_batch_size,
+            "num_train_epochs": num_train_epochs,
+            "max_steps": max_steps,
+            "num_examples": num_examples,
+            "num_train_samples": num_train_samples,
+            "len_dataloader": len_dataloader,
+            "num_update_steps_per_epoch": num_update_steps_per_epoch
+        }
+        return result
+    
+    def _resume_checkpoint_state(self, resume_from_checkpoint, args, num_update_steps_per_epoch):
+        epochs_trained = 0
+        steps_trained_in_current_epoch = 0
+        steps_trained_progress_bar = None
+
+        # Check if continuing training from a checkpoint
+        if resume_from_checkpoint is not None and os.path.isfile(
+            os.path.join(resume_from_checkpoint, TRAINER_STATE_NAME)
+        ):
+            self.state = TrainerState.load_from_json(os.path.join(resume_from_checkpoint, TRAINER_STATE_NAME))
+            epochs_trained = self.state.global_step // num_update_steps_per_epoch
+            if not args.ignore_data_skip:
+                steps_trained_in_current_epoch = self.state.global_step % (num_update_steps_per_epoch)
+                steps_trained_in_current_epoch *= args.gradient_accumulation_steps
+            else:
+                steps_trained_in_current_epoch = 0
+
+            logger.info("  Continuing training from checkpoint, will skip to saved global_step")
+            logger.info(f"  Continuing training from epoch {epochs_trained}")
+            logger.info(f"  Continuing training from global step {self.state.global_step}")
+            if not args.ignore_data_skip:
+                logger.info(
+                    f"  Will skip the first {epochs_trained} epochs then the first {steps_trained_in_current_epoch} "
+                    "batches in the first epoch. If this takes a lot of time, you can add the `--ignore_data_skip` "
+                    "flag to your launch command, but you will resume the training on data already seen by your model."
+                )
+                if self.is_local_process_zero() and not args.disable_tqdm:
+                    steps_trained_progress_bar = tqdm(total=steps_trained_in_current_epoch)
+                    steps_trained_progress_bar.set_description("Skipping the first batches")
+        return epochs_trained, steps_trained_in_current_epoch, steps_trained_progress_bar
+
+    def _inner_training_loop(
+        self, batch_size=None, args=None, resume_from_checkpoint=None, trial=None, ignore_keys_for_eval=None
+    ):
+        self._train_batch_size = batch_size
+        grad_acc_steps = args.gradient_accumulation_steps
+        # Data loader and number of training steps
+        train_dataloader = self.get_train_dataloader()
+
+        # Setting up training control variables
+        training_control_vars = self._training_control_variables(args, train_dataloader)
+        total_train_batch_size = training_control_vars["total_train_batch_size"]
+        num_train_epochs = training_control_vars["num_train_epochs"]
+        max_steps = training_control_vars["max_steps"]
+        num_examples = training_control_vars["num_examples"]
+        num_train_samples = training_control_vars["num_train_samples"]
+        len_dataloader = training_control_vars["len_dataloader"]
+        num_update_steps_per_epoch = training_control_vars["num_update_steps_per_epoch"]
 
         delay_optimizer_creation = (
             self.sharded_ddp is not None
@@ -1464,7 +1499,7 @@ class Trainer:
         logger.info(f"  Num Epochs = {num_train_epochs}")
         logger.info(f"  Instantaneous batch size per device = {args.per_device_train_batch_size}")
         logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_train_batch_size}")
-        logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
+        logger.info(f"  Gradient Accumulation steps = {grad_acc_steps}")
         logger.info(f"  Total optimization steps = {max_steps}")
         logger.info(
             f"  Number of trainable parameters = {sum(p.numel() for p in model.parameters() if p.requires_grad)}"
@@ -1472,34 +1507,10 @@ class Trainer:
 
         self.state.epoch = 0
         start_time = time.time()
-        epochs_trained = 0
-        steps_trained_in_current_epoch = 0
-        steps_trained_progress_bar = None
 
-        # Check if continuing training from a checkpoint
-        if resume_from_checkpoint is not None and os.path.isfile(
-            os.path.join(resume_from_checkpoint, TRAINER_STATE_NAME)
-        ):
-            self.state = TrainerState.load_from_json(os.path.join(resume_from_checkpoint, TRAINER_STATE_NAME))
-            epochs_trained = self.state.global_step // num_update_steps_per_epoch
-            if not args.ignore_data_skip:
-                steps_trained_in_current_epoch = self.state.global_step % (num_update_steps_per_epoch)
-                steps_trained_in_current_epoch *= args.gradient_accumulation_steps
-            else:
-                steps_trained_in_current_epoch = 0
-
-            logger.info("  Continuing training from checkpoint, will skip to saved global_step")
-            logger.info(f"  Continuing training from epoch {epochs_trained}")
-            logger.info(f"  Continuing training from global step {self.state.global_step}")
-            if not args.ignore_data_skip:
-                logger.info(
-                    f"  Will skip the first {epochs_trained} epochs then the first {steps_trained_in_current_epoch} "
-                    "batches in the first epoch. If this takes a lot of time, you can add the `--ignore_data_skip` "
-                    "flag to your launch command, but you will resume the training on data already seen by your model."
-                )
-                if self.is_local_process_zero() and not args.disable_tqdm:
-                    steps_trained_progress_bar = tqdm(total=steps_trained_in_current_epoch)
-                    steps_trained_progress_bar.set_description("Skipping the first batches")
+        epochs_trained, steps_trained_in_current_epoch, steps_trained_progress_bar = self._resume_checkpoint_state(
+            resume_from_checkpoint, args, num_update_steps_per_epoch
+        )
 
         # Update the references
         self.callback_handler.model = self.model
@@ -1552,18 +1563,17 @@ class Trainer:
                 train_dataloader.sampler.set_epoch(epoch)
             elif hasattr(train_dataloader, "dataset") and isinstance(train_dataloader.dataset, IterableDatasetShard):
                 train_dataloader.dataset.set_epoch(epoch)
-
             epoch_iterator = train_dataloader
 
             # Reset the past mems state at the beginning of each epoch if necessary.
             if args.past_index >= 0:
                 self._past = None
 
-            steps_in_epoch = (
-                len(epoch_iterator)
-                if len_dataloader is not None
-                else args.max_steps * args.gradient_accumulation_steps
-            )
+            if len_dataloader is not None:
+                steps_in_epoch = len(epoch_iterator)
+            else:
+                args.max_steps * grad_acc_steps
+
             self.control = self.callback_handler.on_epoch_begin(args, self.state, self.control)
 
             if epoch == epochs_trained and resume_from_checkpoint is not None and steps_trained_in_current_epoch == 0:
@@ -1583,11 +1593,11 @@ class Trainer:
                     steps_trained_progress_bar.close()
                     steps_trained_progress_bar = None
 
-                if step % args.gradient_accumulation_steps == 0:
+                if step % grad_acc_steps == 0:
                     self.control = self.callback_handler.on_step_begin(args, self.state, self.control)
 
                 if (
-                    ((step + 1) % args.gradient_accumulation_steps != 0)
+                    ((step + 1) % grad_acc_steps != 0)
                     and args.local_rank != -1
                     and args._no_sync_in_gradient_accumulation
                 ):
@@ -1609,9 +1619,9 @@ class Trainer:
                 if self.deepspeed:
                     self.deepspeed.step()
 
-                if (step + 1) % args.gradient_accumulation_steps == 0 or (
-                    # last step in epoch but step is always smaller than gradient_accumulation_steps
-                    steps_in_epoch <= args.gradient_accumulation_steps
+                # last step in epoch but step is always smaller than gradient_accumulation_steps
+                if (step + 1) % grad_acc_steps == 0 or (
+                    steps_in_epoch <= grad_acc_steps
                     and (step + 1) == steps_in_epoch
                 ):
                     # Gradient clipping
@@ -1835,7 +1845,6 @@ class Trainer:
 
     def _maybe_log_save_evaluate(self, tr_loss, model, trial, epoch, ignore_keys_for_eval):
         if self.control.should_log:
-
             logs: Dict[str, float] = {}
 
             # all_gather + mean() to get average loss over all processes
@@ -2293,7 +2302,6 @@ class Trainer:
             if self.args.should_save:
                 self._save(output_dir, state_dict=state_dict)
         elif self.deepspeed:
-
             # this takes care of everything as long as we aren't under zero3
             if self.args.should_save:
                 self._save(output_dir)
@@ -2469,9 +2477,7 @@ class Trainer:
         )
 
         self.log(output.metrics)
-
         self.control = self.callback_handler.on_evaluate(self.args, self.state, self.control, output.metrics)
-
         self._memory_tracker.stop_and_update_metrics(output.metrics)
 
         return output.metrics
@@ -2552,12 +2558,10 @@ class Trainer:
         Works both with or without labels.
         """
         args = self.args
-
         prediction_loss_only = prediction_loss_only if prediction_loss_only is not None else args.prediction_loss_only
 
         # if eval is called w/o train init deepspeed here
         if args.deepspeed and not self.deepspeed:
-
             # XXX: eval doesn't have `resume_from_checkpoint` arg but we should be able to do eval
             # from the checkpoint eventually
             deepspeed_engine, _, _ = deepspeed_init(
@@ -2892,5 +2896,3 @@ class Trainer:
             return self.model.floating_point_ops(inputs)
         else:
             return 0
-
-
