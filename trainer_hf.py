@@ -1402,6 +1402,7 @@ class Trainer:
         return result
     
     def _resume_checkpoint_state(self, resume_from_checkpoint, args, num_update_steps_per_epoch):
+        """get the checkpoint state: epochs_trained and steps_trained_in_current_epoch"""
         epochs_trained = 0
         steps_trained_in_current_epoch = 0
         steps_trained_progress_bar = None
@@ -1418,12 +1419,12 @@ class Trainer:
             else:
                 steps_trained_in_current_epoch = 0
 
-            logger.info("  Continuing training from checkpoint, will skip to saved global_step")
-            logger.info(f"  Continuing training from epoch {epochs_trained}")
-            logger.info(f"  Continuing training from global step {self.state.global_step}")
+            logger.info("Continuing training from checkpoint, will skip to saved global_step")
+            logger.info(f"Continuing training from epoch {epochs_trained}")
+            logger.info(f"Continuing training from global step {self.state.global_step}")
             if not args.ignore_data_skip:
                 logger.info(
-                    f"  Will skip the first {epochs_trained} epochs then the first {steps_trained_in_current_epoch} "
+                    f"Will skip the first {epochs_trained} epochs then the first {steps_trained_in_current_epoch} "
                     "batches in the first epoch. If this takes a lot of time, you can add the `--ignore_data_skip` "
                     "flag to your launch command, but you will resume the training on data already seen by your model."
                 )
@@ -1431,6 +1432,45 @@ class Trainer:
                     steps_trained_progress_bar = tqdm(total=steps_trained_in_current_epoch)
                     steps_trained_progress_bar.set_description("Skipping the first batches")
         return epochs_trained, steps_trained_in_current_epoch, steps_trained_progress_bar
+    
+    def grad_clip_scale(self, args, model):
+        # Gradient clipping
+        if args.max_grad_norm is not None and args.max_grad_norm > 0 and not self.deepspeed:
+            # deepspeed does its own clipping
+            if self.do_grad_scaling:
+                # AMP: gradients need unscaling
+                self.scaler.unscale_(self.optimizer)
+
+            if args.fp16:
+                self.optimizer.clip_master_grads(args.max_grad_norm)
+            elif hasattr(self.optimizer, "clip_grad_norm"):
+                # Some optimizers (like the sharded optimizer) have a specific way to do gradient clipping
+                self.optimizer.clip_grad_norm(args.max_grad_norm)
+            elif hasattr(model, "clip_grad_norm_"):
+                # Some models (like FullyShardedDDP) have a specific way to do gradient clipping
+                model.clip_grad_norm_(args.max_grad_norm)
+            else:
+                # Revert to normal clipping otherwise, handling Apex or full precision
+                nn.utils.clip_grad_norm_(
+                    amp.master_params(self.optimizer) if self.use_apex else model.parameters(),
+                    args.max_grad_norm,
+                )
+
+        # Optimizer step
+        optimizer_was_run = True
+        if self.deepspeed:
+            pass  # called outside the loop
+        elif self.do_grad_scaling:
+            scale_before = self.scaler.get_scale()
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+            scale_after = self.scaler.get_scale()
+            optimizer_was_run = scale_before <= scale_after
+        else:
+            self.optimizer.step()
+
+        if optimizer_was_run and not self.deepspeed:
+            self.lr_scheduler.step()
 
     def _inner_training_loop(
         self, batch_size=None, args=None, resume_from_checkpoint=None, trial=None, ignore_keys_for_eval=None
@@ -1495,15 +1535,13 @@ class Trainer:
 
         # Train!
         logger.info("***** Running training *****")
-        logger.info(f"  Num examples = {num_examples}")
-        logger.info(f"  Num Epochs = {num_train_epochs}")
-        logger.info(f"  Instantaneous batch size per device = {args.per_device_train_batch_size}")
-        logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_train_batch_size}")
-        logger.info(f"  Gradient Accumulation steps = {grad_acc_steps}")
-        logger.info(f"  Total optimization steps = {max_steps}")
-        logger.info(
-            f"  Number of trainable parameters = {sum(p.numel() for p in model.parameters() if p.requires_grad)}"
-        )
+        logger.info(f"Num examples = {num_examples}")
+        logger.info(f"Num Epochs = {num_train_epochs}")
+        logger.info(f"Instantaneous batch size per device = {args.per_device_train_batch_size}")
+        logger.info(f"Total train batch size (w. parallel, distributed & accumulation) = {total_train_batch_size}")
+        logger.info(f"Gradient Accumulation steps = {grad_acc_steps}")
+        logger.info(f"Total optimization steps = {max_steps}")
+        logger.info(f"Number of trainable parameters = {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
 
         self.state.epoch = 0
         start_time = time.time()
@@ -1563,14 +1601,13 @@ class Trainer:
                 train_dataloader.sampler.set_epoch(epoch)
             elif hasattr(train_dataloader, "dataset") and isinstance(train_dataloader.dataset, IterableDatasetShard):
                 train_dataloader.dataset.set_epoch(epoch)
-            epoch_iterator = train_dataloader
 
             # Reset the past mems state at the beginning of each epoch if necessary.
             if args.past_index >= 0:
                 self._past = None
 
             if len_dataloader is not None:
-                steps_in_epoch = len(epoch_iterator)
+                steps_in_epoch = len(train_dataloader)
             else:
                 args.max_steps * grad_acc_steps
 
@@ -1580,7 +1617,8 @@ class Trainer:
                 self._load_rng_state(resume_from_checkpoint)
 
             step = -1
-            for step, inputs in enumerate(epoch_iterator):
+            for step, inputs in enumerate(train_dataloader):
+                step = step + 1
                 # Skip past any already trained steps if resuming training
                 if steps_trained_in_current_epoch > 0:
                     steps_trained_in_current_epoch -= 1
@@ -1593,14 +1631,10 @@ class Trainer:
                     steps_trained_progress_bar.close()
                     steps_trained_progress_bar = None
 
-                if step % grad_acc_steps == 0:
+                if (step - 1) % grad_acc_steps == 0:
                     self.control = self.callback_handler.on_step_begin(args, self.state, self.control)
 
-                if (
-                    ((step + 1) % grad_acc_steps != 0)
-                    and args.local_rank != -1
-                    and args._no_sync_in_gradient_accumulation
-                ):
+                if (step % grad_acc_steps != 0) and args.local_rank != -1 and args._no_sync_in_gradient_accumulation:
                     # Avoid unnecessary DDP synchronization since there will be no backward pass on this example.
                     with model.no_sync():
                         tr_loss_step = self.training_step(model, inputs)
@@ -1620,63 +1654,24 @@ class Trainer:
                     self.deepspeed.step()
 
                 # last step in epoch but step is always smaller than gradient_accumulation_steps
-                if (step + 1) % grad_acc_steps == 0 or (
-                    steps_in_epoch <= grad_acc_steps
-                    and (step + 1) == steps_in_epoch
-                ):
-                    # Gradient clipping
-                    if args.max_grad_norm is not None and args.max_grad_norm > 0 and not self.deepspeed:
-                        # deepspeed does its own clipping
-                        if self.do_grad_scaling:
-                            # Reduce gradients first for XLA
-                            # AMP: gradients need unscaling
-                            self.scaler.unscale_(self.optimizer)
-
-                        if args.fp16:
-                            self.optimizer.clip_master_grads(args.max_grad_norm)
-                        elif hasattr(self.optimizer, "clip_grad_norm"):
-                            # Some optimizers (like the sharded optimizer) have a specific way to do gradient clipping
-                            self.optimizer.clip_grad_norm(args.max_grad_norm)
-                        elif hasattr(model, "clip_grad_norm_"):
-                            # Some models (like FullyShardedDDP) have a specific way to do gradient clipping
-                            model.clip_grad_norm_(args.max_grad_norm)
-                        else:
-                            # Revert to normal clipping otherwise, handling Apex or full precision
-                            nn.utils.clip_grad_norm_(
-                                amp.master_params(self.optimizer) if self.use_apex else model.parameters(),
-                                args.max_grad_norm,
-                            )
-
-                    # Optimizer step
-                    optimizer_was_run = True
-                    if self.deepspeed:
-                        pass  # called outside the loop
-                    elif self.do_grad_scaling:
-                        scale_before = self.scaler.get_scale()
-                        self.scaler.step(self.optimizer)
-                        self.scaler.update()
-                        scale_after = self.scaler.get_scale()
-                        optimizer_was_run = scale_before <= scale_after
-                    else:
-                        self.optimizer.step()
-
-                    if optimizer_was_run and not self.deepspeed:
-                        self.lr_scheduler.step()
+                if step % grad_acc_steps == 0 or (steps_in_epoch <= grad_acc_steps and step == steps_in_epoch):
+                    # Gradient clipping, optimizer step and lr_scheduler step
+                    self.grad_clip_scale(args, model)
 
                     model.zero_grad()
                     self.state.global_step += 1
-                    self.state.epoch = epoch + (step + 1) / steps_in_epoch
+                    self.state.epoch = epoch + step / steps_in_epoch
                     self.control = self.callback_handler.on_step_end(args, self.state, self.control)
-
                     self._maybe_log_save_evaluate(tr_loss, model, trial, epoch, ignore_keys_for_eval)
                 else:
                     self.control = self.callback_handler.on_substep_end(args, self.state, self.control)
 
                 if self.control.should_epoch_stop or self.control.should_training_stop:
                     break
+
             if step < 0:
                 logger.warning(
-                    "There seems to be not a single sample in your epoch_iterator, stopping training at step"
+                    "There seems to be not a single sample in your train_dataloader, stopping training at step"
                     f" {self.state.global_step}! This is expected if you're using an IterableDataset and set"
                     f" num_steps ({max_steps}) higher than the number of available samples."
                 )
@@ -1697,7 +1692,6 @@ class Trainer:
             # Wait for everyone to get here so we are sur the model has been saved by process 0.
             if args.local_rank != -1:
                 dist.barrier()
-
             self._load_best_model()
 
         # add remaining tr_loss
@@ -1724,7 +1718,6 @@ class Trainer:
                     shutil.rmtree(checkpoint)
 
         self.control = self.callback_handler.on_train_end(args, self.state, self.control)
-
         return TrainOutput(self.state.global_step, train_loss, metrics)
 
     def _get_output_dir(self, trial):
@@ -1748,7 +1741,7 @@ class Trainer:
         return run_dir
 
     def _load_from_checkpoint(self, resume_from_checkpoint, model=None):
-
+        """_load_from_checkpoint"""
         if model is None:
             model = self.model
 
@@ -1793,7 +1786,6 @@ class Trainer:
         model = self.model
         if os.path.exists(best_model_path):
             if self.deepspeed:
-
                 if self.model_wrapped is not None:
                     # this removes the pre-hooks from the previous engine
                     self.model_wrapped.destroy()
