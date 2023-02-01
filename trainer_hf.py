@@ -18,7 +18,6 @@ The Trainer class, to easily train a 🤗 Transformers from scratch or finetune 
 
 import contextlib
 import functools
-import glob
 import inspect
 import math
 import os
@@ -81,10 +80,10 @@ from transformers.trainer_callback import (
 )
 from transformers.trainer_pt_utils import (
     DistributedLengthGroupedSampler,
-    DistributedSamplerWithLoop,
     IterableDatasetShard,
     LabelSmoother,
     LengthGroupedSampler,
+    ShardSampler,
     distributed_broadcast_scalars,
     distributed_concat,
     find_batch_size,
@@ -751,6 +750,18 @@ class Trainer:
             pin_memory=self.args.dataloader_pin_memory,
             worker_init_fn=seed_worker,
         )
+
+    def _get_eval_sampler(self, eval_dataset: Dataset) -> Optional[torch.utils.data.Sampler]:
+        """_get_eval_sampler"""
+        if self.args.world_size <= 1:
+            return SequentialSampler(eval_dataset)
+        else:
+            return ShardSampler(
+                eval_dataset,
+                batch_size=self.args.per_device_eval_batch_size,
+                num_processes=self.args.world_size,
+                process_index=self.args.process_index,
+            )
 
     def get_eval_dataloader(self, eval_dataset: Optional[Dataset] = None) -> DataLoader:
         """
