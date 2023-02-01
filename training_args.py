@@ -91,7 +91,6 @@ class OptimizerNames(ExplicitEnum):
 
     ADAMW_HF = "adamw_hf"
     ADAMW_TORCH = "adamw_torch"
-    ADAMW_APEX_FUSED = "adamw_apex_fused"
     ADAFACTOR = "adafactor"
     ADAMW_BNB = "adamw_bnb_8bit"
     ADAMW_ANYPRECISION = "adamw_anyprecision"
@@ -254,12 +253,9 @@ class TrainingArguments:
             NVIDIA architecture or using CPU (no_cuda). This is an experimental API and it may change.
         fp16 (`bool`, *optional*, defaults to `False`):
             Whether to use fp16 16-bit (mixed) precision training instead of 32-bit training.
-        fp16_opt_level (`str`, *optional*, defaults to 'O1'):
-            For `fp16` training, Apex AMP optimization level selected in ['O0', 'O1', 'O2', and 'O3']. See details on
-            the [Apex documentation](https://nvidia.github.io/apex/amp).
         half_precision_backend (`str`, *optional*, defaults to `"auto"`):
-            The backend to use for mixed precision training. Must be one of `"auto", "cuda_amp", "apex", "cpu_amp"`.
-            `"auto"` will use CPU/CUDA AMP or APEX depending on the PyTorch version detected, while the other choices
+            The backend to use for mixed precision training. Must be one of `"auto", "cuda_amp", "cpu_amp"`.
+            `"auto"` will use CPU/CUDA AMP depending on the PyTorch version detected, while the other choices
             will force the requested backend.
         bf16_full_eval (`bool`, *optional*, defaults to `False`):
             Whether to use full bfloat16 evaluation instead of 32-bit. This will be faster and save memory but can harm
@@ -379,7 +375,7 @@ class TrainingArguments:
 
             The options should be separated by whitespaces.
         optim (`str` or [`training_args.OptimizerNames`], *optional*, defaults to `"adamw_hf"`):
-            The optimizer to use: adamw_hf, adamw_torch, adamw_apex_fused, adamw_anyprecision or adafactor.
+            The optimizer to use: adamw_hf, adamw_torch, adamw_anyprecision or adafactor.
         optim_args (`str`, *optional*):
             Optional arguments that are supplied to AnyPrecisionAdamW.
         group_by_length (`bool`, *optional*, defaults to `False`):
@@ -651,20 +647,11 @@ class TrainingArguments:
         default=False,
         metadata={"help": "Whether to use fp16 (mixed) precision instead of 32-bit"},
     )
-    fp16_opt_level: str = field(
-        default="O1",
-        metadata={
-            "help": (
-                "For fp16: Apex AMP optimization level selected in ['O0', 'O1', 'O2', and 'O3']. "
-                "See details at https://nvidia.github.io/apex/amp.html"
-            )
-        },
-    )
     half_precision_backend: str = field(
         default="auto",
         metadata={
             "help": "The backend to be used for half precision.",
-            "choices": ["auto", "cuda_amp", "apex", "cpu_amp"],
+            "choices": ["auto", "cuda_amp", "cpu_amp"],
         },
     )
     bf16_full_eval: bool = field(
@@ -1021,11 +1008,6 @@ class TrainingArguments:
             raise ValueError("At most one of fp16 and bf16 can be True for full eval, but not both")
 
         if self.bf16:
-            if self.half_precision_backend == "apex":
-                raise ValueError(
-                    " `--half_precision_backend apex`: GPU bf16 is not supported by apex. Use"
-                    " `--half_precision_backend cuda_amp` instead"
-                )
             if not (self.sharded_ddp == "" or not self.sharded_ddp):
                 raise ValueError("sharded_ddp is not supported with bf16")
 
@@ -1038,7 +1020,7 @@ class TrainingArguments:
             and (self.fp16 or self.fp16_full_eval)
         ):
             raise ValueError(
-                "FP16 Mixed precision training with AMP or APEX (`--fp16`) and FP16 half precision evaluation"
+                "FP16 Mixed precision training with AMP (`--fp16`) and FP16 half precision evaluation"
                 " (`--fp16_full_eval`) can only be used on CUDA devices."
             )
 

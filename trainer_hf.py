@@ -127,7 +127,6 @@ from transformers.utils import (
     WEIGHTS_NAME,
     can_return_loss,
     find_labels,
-    is_apex_available,
     is_datasets_available,
     is_torch_compile_available,
     logging,
@@ -140,9 +139,6 @@ _is_native_cpu_amp_available = is_torch_greater_or_equal_than_1_10
 DEFAULT_CALLBACKS = [DefaultFlowCallback]
 DEFAULT_PROGRESS_CALLBACK = ProgressCallback
 
-
-if is_apex_available():
-    from apex import amp
 
 if is_datasets_available():
     import datasets
@@ -480,7 +476,6 @@ class Trainer:
         self._signature_columns = None
 
         # Mixed precision setup
-        self.use_apex = False
         self.use_cuda_amp = False
         self.use_cpu_amp = False
 
@@ -525,12 +520,7 @@ class Trainer:
                 self.use_cpu_amp = True
                 self.amp_dtype = torch.bfloat16
             else:
-                if not is_apex_available():
-                    raise ImportError(
-                        "Using FP16 with APEX but APEX is not installed, please refer to"
-                        " https://www.github.com/nvidia/apex."
-                    )
-                self.use_apex = True
+                raise ValueError(f"Unsupported half_precision_backend: {args.half_precision_backend}")
 
 
         # Label smoothing
@@ -957,14 +947,6 @@ class Trainer:
 
             optimizer_cls = AdamW
             optimizer_kwargs.update(adam_kwargs)
-        elif args.optim == OptimizerNames.ADAMW_APEX_FUSED:
-            try:
-                from apex.optimizers import FusedAdam
-
-                optimizer_cls = FusedAdam
-                optimizer_kwargs.update(adam_kwargs)
-            except ImportError:
-                raise ValueError("Trainer tried to instantiate apex FusedAdam but apex is not installed!")
         elif args.optim == OptimizerNames.ADAMW_BNB:
             try:
                 from bitsandbytes.optim import Adam8bit
@@ -1168,11 +1150,7 @@ class Trainer:
         if unwrap_model(model) is not model:
             return model
 
-        # Mixed precision training with apex (torch < 1.6)
-        if self.use_apex and training:
-            model, self.optimizer = amp.initialize(model, self.optimizer, opt_level=self.args.fp16_opt_level)
-
-        # Multi-gpu training (should be after apex fp16 initialization)
+        # Multi-gpu training
         if self.args.n_gpu > 1:
             model = nn.DataParallel(model)
 
@@ -1186,7 +1164,7 @@ class Trainer:
         if not training:
             return model
 
-        # Distributed training (should be after apex fp16 initialization)
+        # Distributed training
         if self.sharded_ddp is not None:
             # Sharded DDP!
             if self.sharded_ddp == ShardedDDPOption.SIMPLE:
@@ -1450,11 +1428,8 @@ class Trainer:
                 # Some models (like FullyShardedDDP) have a specific way to do gradient clipping
                 model.clip_grad_norm_(args.max_grad_norm)
             else:
-                # Revert to normal clipping otherwise, handling Apex or full precision
-                nn.utils.clip_grad_norm_(
-                    amp.master_params(self.optimizer) if self.use_apex else model.parameters(),
-                    args.max_grad_norm,
-                )
+                # Revert to normal clipping otherwise, handling full precision
+                nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm,)
 
         # Optimizer step
         optimizer_was_run = True
@@ -2215,9 +2190,6 @@ class Trainer:
 
         if self.do_grad_scaling:
             self.scaler.scale(loss).backward()
-        elif self.use_apex:
-            with amp.scale_loss(loss, self.optimizer) as scaled_loss:
-                scaled_loss.backward()
         elif self.deepspeed:
             # loss gets scaled under gradient_accumulation_steps in deepspeed
             loss = self.deepspeed.backward(loss)
