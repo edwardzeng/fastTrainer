@@ -206,7 +206,7 @@ class Trainer:
             A function that instantiates the model to be used. If provided, each call to [`~Trainer.train`] will start
             from a new instance of the model as given by this function.
 
-            The function may have zero argument, or a single one containing the optuna/Ray Tune/SigOpt trial object, to
+            The function may have zero argument, or a single one containing the wandb trial object, to
             be able to choose different architectures according to hyper parameters (such as layer count, sizes of
             inner layers, dropout probabilities etc).
         compute_metrics (`Callable[[EvalPrediction], Dict]`, *optional*):
@@ -1965,7 +1965,7 @@ class Trainer:
         **kwargs,
     ) -> BestRun:
         """
-        Launch an hyperparameter search using `optuna` or `Ray Tune` or `SigOpt`. The optimized quantity is determined
+        Launch an hyperparameter search using `wandb`. The optimized quantity is determined
         by `compute_objective`, which defaults to a function returning the evaluation loss when no metric is provided,
         the sum of all metrics otherwise.
 
