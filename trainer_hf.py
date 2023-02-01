@@ -41,13 +41,7 @@ from transformers.integrations import (  # isort: split
     get_reporting_integration_callbacks,
     hp_params,
     is_fairscale_available,
-    is_optuna_available,
-    is_ray_tune_available,
-    is_sigopt_available,
     is_wandb_available,
-    run_hp_search_optuna,
-    run_hp_search_ray,
-    run_hp_search_sigopt,
     run_hp_search_wandb,
 )
 
@@ -1031,14 +1025,7 @@ class Trainer:
 
         if self.hp_search_backend is None or trial is None:
             return
-        if self.hp_search_backend == HPSearchBackend.OPTUNA:
-            params = self.hp_space(trial)
-        elif self.hp_search_backend == HPSearchBackend.RAY:
-            params = trial
-            params.pop("wandb", None)
-        elif self.hp_search_backend == HPSearchBackend.SIGOPT:
-            params = {k: int(v) if isinstance(v, str) else v for k, v in trial.assignments.items()}
-        elif self.hp_search_backend == HPSearchBackend.WANDB:
+        if self.hp_search_backend == HPSearchBackend.WANDB:
             params = trial
 
         for key, value in params.items():
@@ -1053,10 +1040,7 @@ class Trainer:
             if old_attr is not None:
                 value = type(old_attr)(value)
             setattr(self.args, key, value)
-        if self.hp_search_backend == HPSearchBackend.OPTUNA:
-            logger.info(f"Trial: {trial.params}")
-        if self.hp_search_backend == HPSearchBackend.SIGOPT:
-            logger.info(f"SigOpt Assignments: {trial.assignments}")
+
         if self.hp_search_backend == HPSearchBackend.WANDB:
             logger.info(f"W&B Sweep parameters: {trial}")
         if self.args.deepspeed:
@@ -1077,25 +1061,6 @@ class Trainer:
             if trial.should_prune():
                 self.callback_handler.on_train_end(self.args, self.state, self.control)
                 raise optuna.TrialPruned()
-        elif self.hp_search_backend == HPSearchBackend.RAY:
-            from ray import tune
-
-            if self.control.should_save:
-                self._tune_save_checkpoint()
-            tune.report(objective=self.objective, **metrics)
-
-    def _tune_save_checkpoint(self):
-        from ray import tune
-
-        if not self.use_tune_checkpoints:
-            return
-        with tune.checkpoint_dir(step=self.state.global_step) as checkpoint_dir:
-            output_dir = os.path.join(checkpoint_dir, f"{PREFIX_CHECKPOINT_DIR}-{self.state.global_step}")
-            self.save_model(output_dir, _internal_call=True)
-            if self.args.should_save:
-                self.state.save_to_json(os.path.join(output_dir, TRAINER_STATE_NAME))
-                torch.save(self.optimizer.state_dict(), os.path.join(output_dir, OPTIMIZER_NAME))
-                torch.save(self.lr_scheduler.state_dict(), os.path.join(output_dir, SCHEDULER_NAME))
 
     def call_model_init(self, trial=None):
         model_init_argcount = number_of_arguments(self.model_init)
@@ -1708,15 +1673,7 @@ class Trainer:
 
     def _get_output_dir(self, trial):
         if self.hp_search_backend is not None and trial is not None:
-            if self.hp_search_backend == HPSearchBackend.OPTUNA:
-                run_id = trial.number
-            elif self.hp_search_backend == HPSearchBackend.RAY:
-                from ray import tune
-
-                run_id = tune.get_trial_id()
-            elif self.hp_search_backend == HPSearchBackend.SIGOPT:
-                run_id = trial.id
-            elif self.hp_search_backend == HPSearchBackend.WANDB:
+            if self.hp_search_backend == HPSearchBackend.WANDB:
                 import wandb
 
                 run_id = wandb.run.id
@@ -2043,11 +2000,6 @@ class Trainer:
                 Additional keyword arguments passed along to `optuna.create_study` or `ray.tune.run`. For more
                 information see:
 
-                - the documentation of
-                  [optuna.create_study](https://optuna.readthedocs.io/en/stable/reference/generated/optuna.study.create_study.html)
-                - the documentation of [tune.run](https://docs.ray.io/en/latest/tune/api_docs/execution.html#tune-run)
-                - the documentation of [sigopt](https://app.sigopt.com/docs/endpoints/experiments/create)
-
         Returns:
             [`trainer_utils.BestRun`]: All the information about the best run.
         """
@@ -2055,22 +2007,13 @@ class Trainer:
             backend = default_hp_search_backend()
             if backend is None:
                 raise RuntimeError(
-                    "At least one of optuna or ray should be installed. "
-                    "To install optuna run `pip install optuna`. "
-                    "To install ray run `pip install ray[tune]`. "
-                    "To install sigopt run `pip install sigopt`."
+                    "Wandb is not installed. "
                 )
         backend = HPSearchBackend(backend)
-        if backend == HPSearchBackend.OPTUNA and not is_optuna_available():
-            raise RuntimeError("You picked the optuna backend, but it is not installed. Use `pip install optuna`.")
-        if backend == HPSearchBackend.RAY and not is_ray_tune_available():
-            raise RuntimeError(
-                "You picked the Ray Tune backend, but it is not installed. Use `pip install 'ray[tune]'`."
-            )
-        if backend == HPSearchBackend.SIGOPT and not is_sigopt_available():
-            raise RuntimeError("You picked the sigopt backend, but it is not installed. Use `pip install sigopt`.")
+
         if backend == HPSearchBackend.WANDB and not is_wandb_available():
             raise RuntimeError("You picked the wandb backend, but it is not installed. Use `pip install wandb`.")
+
         self.hp_search_backend = backend
         if self.model_init is None:
             raise RuntimeError(
@@ -2082,9 +2025,6 @@ class Trainer:
         self.compute_objective = default_compute_objective if compute_objective is None else compute_objective
 
         backend_dict = {
-            HPSearchBackend.OPTUNA: run_hp_search_optuna,
-            HPSearchBackend.RAY: run_hp_search_ray,
-            HPSearchBackend.SIGOPT: run_hp_search_sigopt,
             HPSearchBackend.WANDB: run_hp_search_wandb,
         }
         best_run = backend_dict[backend](self, n_trials, direction, **kwargs)
