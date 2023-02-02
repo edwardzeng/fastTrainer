@@ -28,9 +28,7 @@ from transformers.trainer_utils import (
 from transformers.utils import (
     ExplicitEnum,
     cached_property,
-    ccl_version,
     is_accelerate_available,
-    is_psutil_available,
     is_torch_available,
     is_torch_bf16_cpu_available,
     is_torch_bf16_gpu_available,
@@ -270,8 +268,6 @@ class TrainingArguments:
             experimental API and it may change.
         local_rank (`int`, *optional*, defaults to -1):
             Rank of the process during distributed training.
-        xpu_backend (`str`, *optional*):
-            The backend to use for xpu distributed training. Must be one of `"mpi"` or `"ccl"` or `"gloo"`.
         dataloader_drop_last (`bool`, *optional*, defaults to `False`):
             Whether to drop the last incomplete batch (if the length of the dataset is not divisible by the batch size)
             or not.
@@ -671,13 +667,6 @@ class TrainingArguments:
         },
     )
     local_rank: int = field(default=-1, metadata={"help": "For distributed training: local_rank"})
-    xpu_backend: Optional[str] = field(
-        default=None,
-        metadata={
-            "help": "The backend to be used for distributed training on Intel XPU.",
-            "choices": ["mpi", "ccl", "gloo"],
-        },
-    )
     debug: str = field(
         default="",
         metadata={
@@ -1172,58 +1161,7 @@ class TrainingArguments:
             )
             if self.local_rank != -1 and not torch.distributed.is_initialized():
                 # Initializes distributed backend for cpu
-                if self.xpu_backend not in ("mpi", "ccl", "gloo"):
-                    raise ValueError(
-                        "CPU distributed training backend is not properly set. "
-                        "Please set '--xpu_backend' to either 'mpi' or 'ccl' or 'gloo'."
-                    )
-                if self.xpu_backend == "ccl":
-                    requires_backends(self, "oneccl_bind_pt")
-                    if ccl_version >= "1.12":
-                        import oneccl_bindings_for_pytorch  # noqa: F401
-                    else:
-                        import torch_ccl  # noqa: F401
-                    if int(os.environ.get("CCL_WORKER_COUNT", 0)) < 1:
-                        raise ValueError(
-                            "CPU distributed training backend is ccl. but CCL_WORKER_COUNT is not correctly set. "
-                            "Please use like 'export CCL_WORKER_COUNT = 1' to set."
-                        )
-
-                # Try to get launch configuration from environment variables set by MPI launcher - works for Intel MPI, OpenMPI and MVAPICH
-                rank = get_int_from_env(["RANK", "PMI_RANK", "OMPI_COMM_WORLD_RANK", "MV2_COMM_WORLD_RANK"], 0)
-                size = get_int_from_env(["WORLD_SIZE", "PMI_SIZE", "OMPI_COMM_WORLD_SIZE", "MV2_COMM_WORLD_SIZE"], 1)
-                local_size = get_int_from_env(
-                    ["MPI_LOCALNRANKS", "OMPI_COMM_WORLD_LOCAL_SIZE", "MV2_COMM_WORLD_LOCAL_SIZE"], 1
-                )
-                os.environ["RANK"] = str(rank)
-                os.environ["WORLD_SIZE"] = str(size)
-                os.environ["LOCAL_RANK"] = str(self.local_rank)
-                if not os.environ.get("MASTER_PORT", None):
-                    os.environ["MASTER_PORT"] = "29500"
-                if not os.environ.get("MASTER_ADDR", None):
-                    if local_size != size or self.xpu_backend != "mpi":
-                        raise ValueError(
-                            "Looks like distributed multinode run but MASTER_ADDR env not set, "
-                            "please try exporting rank 0's hostname as MASTER_ADDR"
-                        )
-                if (
-                    torch.get_num_threads() == 1
-                    and get_int_from_env(["OMP_NUM_THREADS", "MKL_NUM_THREADS"], 0) == 0
-                    and is_psutil_available()
-                ):
-                    import psutil
-
-                    num_cpu_threads_per_process = int(psutil.cpu_count(logical=False) / local_size)
-                    if num_cpu_threads_per_process == 0:
-                        num_cpu_threads_per_process = 1
-                    torch.set_num_threads(num_cpu_threads_per_process)
-                    logger.info(
-                        f"num_cpu_threads_per_process unset, we set it at {num_cpu_threads_per_process} to improve oob"
-                        " performance."
-                    )
-                torch.distributed.init_process_group(
-                    backend=self.xpu_backend, rank=rank, world_size=size, timeout=self.ddp_timeout_delta
-                )
+                raise ValueError("CPU distributed backend is not supported")
         elif self.deepspeed:
             # deepspeed inits torch.distributed internally
             from transformers.deepspeed import is_deepspeed_available
@@ -1316,13 +1254,12 @@ class TrainingArguments:
     @property
     def parallel_mode(self):
         """
-        The current mode used for parallelism if multiple GPUs/TPU cores are available. One of:
+        The current mode used for parallelism if multiple GPUs cores are available. One of:
 
         - `ParallelMode.NOT_PARALLEL`: no parallelism (CPU or one GPU).
         - `ParallelMode.NOT_DISTRIBUTED`: several GPUs in one single process (uses `torch.nn.DataParallel`).
         - `ParallelMode.DISTRIBUTED`: several GPUs, each having its own process (uses
           `torch.nn.DistributedDataParallel`).
-        - `ParallelMode.TPU`: several TPU cores.
         """
         requires_backends(self, ["torch"])
         if self.local_rank != -1:

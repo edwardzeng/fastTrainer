@@ -74,7 +74,6 @@ from transformers.trainer_callback import (
 )
 from transformers.trainer_pt_utils import (
     DistributedLengthGroupedSampler,
-    IterableDatasetShard,
     LabelSmoother,
     LengthGroupedSampler,
     ShardSampler,
@@ -97,7 +96,6 @@ from transformers.trainer_utils import (
     FSDPOption,
     HPSearchBackend,
     PredictionOutput,
-    RemoveColumnsCollator,
     ShardedDDPOption,
     TrainerMemoryTracker,
     TrainOutput,
@@ -120,21 +118,17 @@ from transformers.utils import (
     WEIGHTS_NAME,
     can_return_loss,
     find_labels,
-    is_datasets_available,
     is_torch_compile_available,
     logging,
 )
 from transformers.utils.generic import ContextManagers
+import datasets
 
 
 _is_native_cpu_amp_available = is_torch_greater_or_equal_than_1_10
 
 DEFAULT_CALLBACKS = [DefaultFlowCallback]
 DEFAULT_PROGRESS_CALLBACK = ProgressCallback
-
-
-if is_datasets_available():
-    import datasets
 
 
 if is_fairscale_available():
@@ -185,15 +179,9 @@ class Trainer:
             The function to use to form a batch from a list of elements of `train_dataset` or `eval_dataset`. Will
             default to [`default_data_collator`] if no `tokenizer` is provided, an instance of
             [`DataCollatorWithPadding`] otherwise.
-        train_dataset (`torch.utils.data.Dataset` or `torch.utils.data.IterableDataset`, *optional*):
+        train_dataset (`torch.utils.data.Dataset`, *optional*):
             The dataset to use for training. If it is a [`~datasets.Dataset`], columns not accepted by the
             `model.forward()` method are automatically removed.
-
-            Note that if it's a `torch.utils.data.IterableDataset` with some randomization and you are training in a
-            distributed fashion, your iterable dataset should either use a internal attribute `generator` that is a
-            `torch.Generator` for the randomization that must be identical on all processes (and the Trainer will
-            manually set the seed of this `generator` at each epoch) or have a `set_epoch()` method that internally
-            sets the seed of the RNGs used.
         eval_dataset (Union[`torch.utils.data.Dataset`, Dict[str, `torch.utils.data.Dataset`]), *optional*):
              The dataset to use for evaluation. If it is a [`~datasets.Dataset`], columns not accepted by the
              `model.forward()` method are automatically removed. If it is a dictionary, it will evaluate on each
@@ -456,15 +444,8 @@ class Trainer:
         if args.max_steps > 0:
             logger.info("max_steps is given, it will override any value given in num_train_epochs")
 
-        if train_dataset is not None and not has_length(train_dataset) and args.max_steps <= 0:
-            raise ValueError("train_dataset does not implement __len__, max_steps has to be specified")
-
-        if (
-            train_dataset is not None
-            and isinstance(train_dataset, torch.utils.data.IterableDataset)
-            and args.group_by_length
-        ):
-            raise ValueError("the `--group_by_length` option is only available for `Dataset`, not `IterableDataset")
+        if train_dataset is not None and not has_length(train_dataset):
+            raise ValueError("train_dataset does not implement __len__")
 
         self._signature_columns = None
 
@@ -532,7 +513,6 @@ class Trainer:
         # returned to 0 every time flos need to be logged
         self.current_flos = 0
         self.hp_search_backend = None
-        self.use_tune_checkpoints = False
         default_label_names = find_labels(self.model.__class__)
         self.label_names = default_label_names if self.args.label_names is None else self.args.label_names
         self.can_return_loss = can_return_loss(self.model.__class__)
@@ -616,27 +596,8 @@ class Trainer:
 
         return dataset.remove_columns(ignored_columns)
 
-    def _get_collator_with_removed_columns(
-        self, data_collator: Callable, description: Optional[str] = None
-    ) -> Callable:
-        """Wrap the data collator in a callable removing unused columns."""
-        if not self.args.remove_unused_columns:
-            return data_collator
-        self._set_signature_columns_if_needed()
-        signature_columns = self._signature_columns
-
-        # RemoveColumnsCollator的作用是什么？
-        remove_columns_collator = RemoveColumnsCollator(
-            data_collator=data_collator,
-            signature_columns=signature_columns,
-            logger=logger,
-            description=description,
-            model_name=self.model.__class__.__name__,
-        )
-        return remove_columns_collator
-
     def _get_train_sampler(self) -> Optional[torch.utils.data.Sampler]:
-        if self.train_dataset is None or not has_length(self.train_dataset):
+        if self.train_dataset is None:
             return None
 
         generator = None
@@ -655,14 +616,11 @@ class Trainer:
 
         # Build the sampler.
         if self.args.group_by_length:
-            if is_datasets_available() and isinstance(self.train_dataset, datasets.Dataset):
-                lengths = (
-                    self.train_dataset[self.args.length_column_name]
-                    if self.args.length_column_name in self.train_dataset.column_names
-                    else None
-                )
-            else:
-                lengths = None
+            lengths = (
+                self.train_dataset[self.args.length_column_name]
+                if self.args.length_column_name in self.train_dataset.column_names
+                else None
+            )
             model_input_name = self.tokenizer.model_input_names[0] if self.tokenizer is not None else None
             batch_size = self.args.train_batch_size * self.args.gradient_accumulation_steps
             if self.args.world_size <= 1:
@@ -709,29 +667,7 @@ class Trainer:
 
         train_dataset = self.train_dataset
         data_collator = self.data_collator
-        if is_datasets_available() and isinstance(train_dataset, datasets.Dataset):
-            train_dataset = self._remove_unused_columns(train_dataset, description="training")
-        else:
-            data_collator = self._get_collator_with_removed_columns(data_collator, description="training")
-
-        if isinstance(train_dataset, torch.utils.data.IterableDataset):
-            if self.args.world_size > 1:
-                train_dataset = IterableDatasetShard(
-                    train_dataset,
-                    batch_size=self._train_batch_size,
-                    drop_last=self.args.dataloader_drop_last,
-                    num_processes=self.args.world_size,
-                    process_index=self.args.process_index,
-                )
-
-            return DataLoader(
-                train_dataset,
-                batch_size=self.args.per_device_train_batch_size,
-                collate_fn=data_collator,
-                num_workers=self.args.dataloader_num_workers,
-                pin_memory=self.args.dataloader_pin_memory,
-            )
-
+        train_dataset = self._remove_unused_columns(train_dataset, description="training")
         train_sampler = self._get_train_sampler()
 
         return DataLoader(
@@ -772,29 +708,7 @@ class Trainer:
             raise ValueError("Trainer: evaluation requires an eval_dataset.")
         eval_dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
         data_collator = self.data_collator
-
-        if is_datasets_available() and isinstance(eval_dataset, datasets.Dataset):
-            eval_dataset = self._remove_unused_columns(eval_dataset, description="evaluation")
-        else:
-            data_collator = self._get_collator_with_removed_columns(data_collator, description="evaluation")
-
-        if isinstance(eval_dataset, torch.utils.data.IterableDataset):
-            if self.args.world_size > 1:
-                eval_dataset = IterableDatasetShard(
-                    eval_dataset,
-                    batch_size=self.args.per_device_eval_batch_size,
-                    drop_last=self.args.dataloader_drop_last,
-                    num_processes=self.args.world_size,
-                    process_index=self.args.process_index,
-                )
-            return DataLoader(
-                eval_dataset,
-                batch_size=self.args.eval_batch_size,
-                collate_fn=data_collator,
-                num_workers=self.args.dataloader_num_workers,
-                pin_memory=self.args.dataloader_pin_memory,
-            )
-
+        eval_dataset = self._remove_unused_columns(eval_dataset, description="evaluation")
         eval_sampler = self._get_eval_sampler(eval_dataset)
 
         return DataLoader(
@@ -819,29 +733,7 @@ class Trainer:
                 `model.forward()` method are automatically removed. It must implement `__len__`.
         """
         data_collator = self.data_collator
-
-        if is_datasets_available() and isinstance(test_dataset, datasets.Dataset):
-            test_dataset = self._remove_unused_columns(test_dataset, description="test")
-        else:
-            data_collator = self._get_collator_with_removed_columns(data_collator, description="test")
-
-        if isinstance(test_dataset, torch.utils.data.IterableDataset):
-            if self.args.world_size > 1:
-                test_dataset = IterableDatasetShard(
-                    test_dataset,
-                    batch_size=self.args.eval_batch_size,
-                    drop_last=self.args.dataloader_drop_last,
-                    num_processes=self.args.world_size,
-                    process_index=self.args.process_index,
-                )
-            return DataLoader(
-                test_dataset,
-                batch_size=self.args.eval_batch_size,
-                collate_fn=data_collator,
-                num_workers=self.args.dataloader_num_workers,
-                pin_memory=self.args.dataloader_pin_memory,
-            )
-
+        test_dataset = self._remove_unused_columns(test_dataset, description="test")
         test_sampler = self._get_eval_sampler(test_dataset)
 
         # We use the same batch_size as for eval.
@@ -1011,10 +903,6 @@ class Trainer:
         dataloader.dataset does not exist or has no length, estimates as best it can
         """
         try:
-            dataset = dataloader.dataset
-            # Special case for IterableDatasetShard, we need to dig deeper
-            if isinstance(dataset, IterableDatasetShard):
-                return len(dataloader.dataset.dataset)
             return len(dataloader.dataset)
         except (NameError, AttributeError, TypeError):  # no dataset or length, estimate by length of dataloader
             return len(dataloader) * self.args.per_device_train_batch_size
@@ -1314,36 +1202,23 @@ class Trainer:
         result = {}
         total_train_batch_size = args.train_batch_size * args.gradient_accumulation_steps * args.world_size
 
-        len_dataloader = None
-        if has_length(train_dataloader):
-            len_dataloader = len(train_dataloader)
-            num_update_steps_per_epoch = len_dataloader // args.gradient_accumulation_steps
-            num_update_steps_per_epoch = max(num_update_steps_per_epoch, 1)
-            num_examples = self.num_examples(train_dataloader)
-            if args.max_steps > 0:
-                max_steps = args.max_steps
-                num_train_epochs = args.max_steps // num_update_steps_per_epoch + int(
-                    args.max_steps % num_update_steps_per_epoch > 0
-                )
-                # May be slightly incorrect if the last batch in the training dataloader has a smaller size but it's
-                # the best we can do.
-                num_train_samples = args.max_steps * total_train_batch_size
-            else:
-                max_steps = math.ceil(args.num_train_epochs * num_update_steps_per_epoch)
-                num_train_epochs = math.ceil(args.num_train_epochs)
-                num_train_samples = self.num_examples(train_dataloader) * args.num_train_epochs
-        elif args.max_steps > 0:  # Rely on max_steps when dataloader does not have a working size
+        len_dataloader = len(train_dataloader)
+        num_update_steps_per_epoch = len_dataloader // args.gradient_accumulation_steps
+        num_update_steps_per_epoch = max(num_update_steps_per_epoch, 1)
+        num_examples = self.num_examples(train_dataloader)
+        if args.max_steps > 0:
             max_steps = args.max_steps
-            # Setting a very large number of epochs so we go as many times as necessary over the iterator.
-            num_train_epochs = sys.maxsize
-            num_update_steps_per_epoch = max_steps
-            num_examples = total_train_batch_size * args.max_steps
+            num_train_epochs = args.max_steps // num_update_steps_per_epoch + int(
+                args.max_steps % num_update_steps_per_epoch > 0
+            )
+            # May be slightly incorrect if the last batch in the training dataloader has a smaller size but it's
+            # the best we can do.
             num_train_samples = args.max_steps * total_train_batch_size
         else:
-            raise ValueError(
-                "args.max_steps must be set to a positive value if dataloader does not have a length, was"
-                f" {args.max_steps}"
-            )
+            max_steps = math.ceil(args.num_train_epochs * num_update_steps_per_epoch)
+            num_train_epochs = math.ceil(args.num_train_epochs)
+            num_train_samples = self.num_examples(train_dataloader) * args.num_train_epochs
+
         result = {
             "total_train_batch_size": total_train_batch_size,
             "num_train_epochs": num_train_epochs,
@@ -1426,9 +1301,11 @@ class Trainer:
     def _inner_training_loop(
         self, batch_size=None, args=None, resume_from_checkpoint=None, trial=None, ignore_keys_for_eval=None
     ):
+        # 在搜索batch_size阶段，传入的batch_size都会变化，每次除以2
         self._train_batch_size = batch_size
         grad_acc_steps = args.gradient_accumulation_steps
         # Data loader and number of training steps
+        # 相应的dataloader中的batch_size会随着self._train_batch_size变化
         train_dataloader = self.get_train_dataloader()
 
         # Setting up training control variables
@@ -1511,7 +1388,7 @@ class Trainer:
             # parameter to Train when using DDP.
             self.state.trial_name = self.hp_name(self._trial)
         if trial is not None:
-            assignments = trial.assignments if self.hp_search_backend == HPSearchBackend.SIGOPT else trial
+            assignments = trial
             self.state.trial_params = hp_params(assignments)
         else:
             self.state.trial_params = None
@@ -1550,18 +1427,12 @@ class Trainer:
         for epoch in range(epochs_trained, num_train_epochs):
             if isinstance(train_dataloader, DataLoader) and isinstance(train_dataloader.sampler, DistributedSampler):
                 train_dataloader.sampler.set_epoch(epoch)
-            elif hasattr(train_dataloader, "dataset") and isinstance(train_dataloader.dataset, IterableDatasetShard):
-                train_dataloader.dataset.set_epoch(epoch)
 
             # Reset the past mems state at the beginning of each epoch if necessary.
             if args.past_index >= 0:
                 self._past = None
 
-            if len_dataloader is not None:
-                steps_in_epoch = len(train_dataloader)
-            else:
-                args.max_steps * grad_acc_steps
-
+            steps_in_epoch = len(train_dataloader)
             self.control = self.callback_handler.on_epoch_begin(args, self.state, self.control)
 
             if epoch == epochs_trained and resume_from_checkpoint is not None and steps_trained_in_current_epoch == 0:
@@ -1623,8 +1494,7 @@ class Trainer:
             if step < 0:
                 logger.warning(
                     "There seems to be not a single sample in your train_dataloader, stopping training at step"
-                    f" {self.state.global_step}! This is expected if you're using an IterableDataset and set"
-                    f" num_steps ({max_steps}) higher than the number of available samples."
+                    f" {self.state.global_step}!"
                 )
                 self.control.should_training_stop = True
 
@@ -2499,10 +2369,7 @@ class Trainer:
         batch_size = self.args.eval_batch_size
 
         logger.info(f"***** Running {description} *****")
-        if has_length(dataloader):
-            logger.info(f"  Num examples = {self.num_examples(dataloader)}")
-        else:
-            logger.info("  Num examples: Unknown")
+        logger.info(f"  Num examples = {self.num_examples(dataloader)}")
         logger.info(f"  Batch size = {batch_size}")
 
         model.eval()
@@ -2612,17 +2479,8 @@ class Trainer:
             all_labels = labels if all_labels is None else nested_concat(all_labels, labels, padding_index=-100)
 
         # Number of samples
-        if has_length(eval_dataset):
-            num_samples = len(eval_dataset)
-        # The instance check is weird and does not actually check for the type, but whether the dataset has the right
-        # methods. Therefore we need to make sure it also has the attribute.
-        elif isinstance(eval_dataset, IterableDatasetShard) and getattr(eval_dataset, "num_examples", 0) > 0:
-            num_samples = eval_dataset.num_examples
-        else:
-            if has_length(dataloader):
-                num_samples = self.num_examples(dataloader)
-            else:  # both len(dataloader.dataset) and len(dataloader) fail
-                num_samples = observed_num_examples
+        num_samples = len(eval_dataset)
+
         if num_samples == 0 and observed_num_examples > 0:
             num_samples = observed_num_examples
 
