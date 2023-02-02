@@ -1225,7 +1225,6 @@ class Trainer:
             "max_steps": max_steps,
             "num_examples": num_examples,
             "num_train_samples": num_train_samples,
-            "len_dataloader": len_dataloader,
             "num_update_steps_per_epoch": num_update_steps_per_epoch
         }
         return result
@@ -1315,7 +1314,6 @@ class Trainer:
         max_steps = training_control_vars["max_steps"]
         num_examples = training_control_vars["num_examples"]
         num_train_samples = training_control_vars["num_train_samples"]
-        len_dataloader = training_control_vars["len_dataloader"]
         num_update_steps_per_epoch = training_control_vars["num_update_steps_per_epoch"]
 
         delay_optimizer_creation = (
