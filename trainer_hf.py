@@ -2236,8 +2236,7 @@ class Trainer:
         eval_dataloader = self.get_eval_dataloader(eval_dataset)
         start_time = time.time()
 
-        eval_loop = self.evaluation_loop
-        output = eval_loop(
+        output = self.evaluation_loop(
             eval_dataloader,
             description="Evaluation",
             # No point gathering the predictions if there are no metrics, otherwise we defer to
@@ -2306,8 +2305,7 @@ class Trainer:
         test_dataloader = self.get_test_dataloader(test_dataset)
         start_time = time.time()
 
-        eval_loop = self.evaluation_loop
-        output = eval_loop(
+        output = self.evaluation_loop(
             test_dataloader, description="Prediction", ignore_keys=ignore_keys, metric_key_prefix=metric_key_prefix
         )
         total_batch_size = self.args.eval_batch_size * self.args.world_size
