@@ -17,7 +17,6 @@ The Trainer class, to easily train a 🤗 Transformers from scratch or finetune 
 """
 
 import contextlib
-import functools
 import inspect
 import math
 import os
@@ -40,7 +39,6 @@ from transformers.integrations import (  # isort: split
     default_hp_search_backend,
     get_reporting_integration_callbacks,
     hp_params,
-    is_fairscale_available,
     is_wandb_available,
     run_hp_search_wandb,
 )
@@ -57,7 +55,6 @@ from transformers import __version__
 from transformers.configuration_utils import PretrainedConfig
 from transformers.data.data_collator import DataCollator, DataCollatorWithPadding, default_data_collator
 from transformers.deepspeed import deepspeed_init, is_deepspeed_zero3_enabled
-from transformers.dependency_versions_check import dep_version_check
 from transformers.modeling_utils import PreTrainedModel, load_sharded_checkpoint, unwrap_model
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES, MODEL_MAPPING_NAMES
 from transformers.optimization import Adafactor, get_scheduler
@@ -80,7 +77,6 @@ from transformers.trainer_pt_utils import (
     distributed_broadcast_scalars,
     distributed_concat,
     find_batch_size,
-    get_module_class_from_name,
     get_parameter_names,
     nested_concat,
     nested_detach,
@@ -93,10 +89,8 @@ from transformers.trainer_utils import (
     BestRun,
     EvalLoopOutput,
     EvalPrediction,
-    FSDPOption,
     HPSearchBackend,
     PredictionOutput,
-    ShardedDDPOption,
     TrainerMemoryTracker,
     TrainOutput,
     default_compute_objective,
@@ -129,17 +123,6 @@ _is_native_cpu_amp_available = is_torch_greater_or_equal_than_1_10
 
 DEFAULT_CALLBACKS = [DefaultFlowCallback]
 DEFAULT_PROGRESS_CALLBACK = ProgressCallback
-
-
-if is_fairscale_available():
-    dep_version_check("fairscale")
-    import fairscale
-    from fairscale.nn.data_parallel import FullyShardedDataParallel as FullyShardedDDP
-    from fairscale.nn.data_parallel import ShardedDataParallel as ShardedDDP
-    from fairscale.nn.wrap import auto_wrap
-    from fairscale.optim import OSS
-    from fairscale.optim.grad_scaler import ShardedGradScaler
-
 
 
 if TYPE_CHECKING:
@@ -307,74 +290,17 @@ class Trainer:
                 "Training an 8-bit model is not supported yet. "
             )
 
-        # Setup Sharded DDP training
-        self.sharded_ddp = None
-        if len(args.sharded_ddp) > 0:
-            if args.deepspeed:
-                raise ValueError(
-                    "Using --sharded_ddp xxx together with --deepspeed is not possible, deactivate one of those flags."
-                )
-            if len(args.fsdp) > 0:
-                raise ValueError(
-                    "Using --sharded_ddp xxx together with --fsdp is not possible, deactivate one of those flags."
-                )
-
-            if args.local_rank == -1:
-                raise ValueError("Using sharded DDP only works in distributed training.")
-            elif not is_fairscale_available():
-                raise ImportError("Sharded DDP training requires fairscale: `pip install fairscale`.")
-            elif ShardedDDPOption.SIMPLE not in args.sharded_ddp and FullyShardedDDP is None:
-                raise ImportError(
-                    "Sharded DDP in a mode other than simple training requires fairscale version >= 0.3, found "
-                    f"{fairscale.__version__}. Upgrade your fairscale library: `pip install --upgrade fairscale`."
-                )
-            elif ShardedDDPOption.SIMPLE in args.sharded_ddp:
-                self.sharded_ddp = ShardedDDPOption.SIMPLE
-            elif ShardedDDPOption.ZERO_DP_2 in args.sharded_ddp:
-                self.sharded_ddp = ShardedDDPOption.ZERO_DP_2
-            elif ShardedDDPOption.ZERO_DP_3 in args.sharded_ddp:
-                self.sharded_ddp = ShardedDDPOption.ZERO_DP_3
-
-        self.fsdp = None
-        if len(args.fsdp) > 0:
-            if args.deepspeed:
-                raise ValueError(
-                    "Using --fsdp xxx together with --deepspeed is not possible, deactivate one of those flags."
-                )
-            if args.local_rank == -1:
-                raise ValueError("Using fsdp only works in distributed training.")
-
-            # dep_version_check("torch>=1.12.0")
-            # Would have to update setup.py with torch>=1.12.0
-            # which isn't ideally given that it will force people not using FSDP to also use torch>=1.12.0
-            # below is the current alternative.
-            if version.parse(version.parse(torch.__version__).base_version) < version.parse("1.12.0"):
-                raise ValueError("FSDP requires PyTorch >= 1.12.0")
-
-            from torch.distributed.fsdp.fully_sharded_data_parallel import ShardingStrategy
-
-            if FSDPOption.FULL_SHARD in args.fsdp:
-                self.fsdp = ShardingStrategy.FULL_SHARD
-            elif FSDPOption.SHARD_GRAD_OP in args.fsdp:
-                self.fsdp = ShardingStrategy.SHARD_GRAD_OP
-            elif FSDPOption.NO_SHARD in args.fsdp:
-                self.fsdp = ShardingStrategy.NO_SHARD
-
         # one place to sort out whether to place the model on device or not
         # postpone switching model to cuda when:
         # 1. MP - since we are trying to fit a much bigger than 1 gpu model
         # 2. fp16-enabled DeepSpeed loads the model in half the size and it doesn't need .to() anyway,
         #    and we only use deepspeed for training at the moment
         # 3. full bf16 or fp16 eval - since the model needs to be cast to the right dtype first
-        # 4. Sharded DDP - same as MP
-        # 5. FSDP - same as MP
         self.place_model_on_device = args.place_model_on_device
         if (
             self.is_model_parallel
             or args.deepspeed
             or ((args.fp16_full_eval or args.bf16_full_eval) and not args.do_train)
-            or (self.sharded_ddp in [ShardedDDPOption.ZERO_DP_2, ShardedDDPOption.ZERO_DP_3])
-            or (self.fsdp is not None)
         ):
             self.place_model_on_device = False
 
@@ -418,11 +344,9 @@ class Trainer:
                     " `Trainer`. Make sure the lines `import torch_xla.core.xla_model as xm` and"
                     " `model.to(xm.xla_device())` is performed before the optimizer creation in your script."
                 )
-        if ((self.sharded_ddp is not None) or args.deepspeed or (self.fsdp is not None)) and (
-            self.optimizer is not None or self.lr_scheduler is not None
-        ):
+        if args.deepspeed and (self.optimizer is not None or self.lr_scheduler is not None):
             raise RuntimeError(
-                "Passing `optimizers` is not allowed if Fairscale, Deepspeed or PyTorch FSDP is enabled."
+                "Passing `optimizers` is not allowed if Deepspeed is enabled."
                 "You should subclass `Trainer` and override the `create_optimizer_and_scheduler` method."
             )
         default_callbacks = DEFAULT_CALLBACKS + get_reporting_integration_callbacks(self.args.report_to)
@@ -474,22 +398,7 @@ class Trainer:
                 self.use_cuda_amp = True
                 self.amp_dtype = torch.float16 if args.fp16 else torch.bfloat16
                 self.do_grad_scaling = True
-                if self.sharded_ddp is not None:
-                    self.scaler = ShardedGradScaler()
-                elif self.fsdp is not None:
-                    if self.amp_dtype == torch.float16:
-                        from torch.distributed.fsdp.sharded_grad_scaler import (
-                            ShardedGradScaler as FSDPShardedGradScaler,
-                        )
-
-                        self.scaler = FSDPShardedGradScaler()
-                    # fsdp不支持bfloat16?
-                    else:
-                        self.do_grad_scaling = False
-                        self.use_cuda_amp = False
-                        self.amp_dtype = None
-                else:
-                    self.scaler = torch.cuda.amp.GradScaler()
+                self.scaler = torch.cuda.amp.GradScaler()
             elif args.half_precision_backend == "cpu_amp":
                 self.use_cpu_amp = True
                 self.amp_dtype = torch.bfloat16
@@ -782,28 +691,21 @@ class Trainer:
             ]
 
             optimizer_cls, optimizer_kwargs = Trainer.get_optimizer_cls_and_kwargs(self.args)
+            self.optimizer = optimizer_cls(optimizer_grouped_parameters, **optimizer_kwargs)
 
-            if self.sharded_ddp == ShardedDDPOption.SIMPLE:
-                self.optimizer = OSS(
-                    params=optimizer_grouped_parameters,
-                    optim=optimizer_cls,
-                    **optimizer_kwargs,
-                )
-            else:
-                self.optimizer = optimizer_cls(optimizer_grouped_parameters, **optimizer_kwargs)
-                if optimizer_cls.__name__ == "Adam8bit":
-                    import bitsandbytes
+            if optimizer_cls.__name__ == "Adam8bit":
+                import bitsandbytes
 
-                    manager = bitsandbytes.optim.GlobalOptimManager.get_instance()
+                manager = bitsandbytes.optim.GlobalOptimManager.get_instance()
 
-                    skipped = 0
-                    for module in opt_model.modules():
-                        if isinstance(module, nn.Embedding):
-                            skipped += sum(dict((p.data_ptr(), p.numel()) for p in module.parameters()).values())
-                            print(f"skipped {module}: {skipped/2**20}M params")
-                            manager.register_module_override(module, "weight", {"optim_bits": 32})
-                            logger.debug(f"bitsandbytes: will optimize {module} in fp32")
-                    print(f"skipped: {skipped/2**20}M params")
+                skipped = 0
+                for module in opt_model.modules():
+                    if isinstance(module, nn.Embedding):
+                        skipped += sum(dict((p.data_ptr(), p.numel()) for p in module.parameters()).values())
+                        print(f"skipped {module}: {skipped/2**20}M params")
+                        manager.register_module_override(module, "weight", {"optim_bits": 32})
+                        logger.debug(f"bitsandbytes: will optimize {module} in fp32")
+                print(f"skipped: {skipped/2**20}M params")
 
         return self.optimizer
 
@@ -1029,72 +931,7 @@ class Trainer:
             return model
 
         # Distributed training
-        if self.sharded_ddp is not None:
-            # Sharded DDP!
-            if self.sharded_ddp == ShardedDDPOption.SIMPLE:
-                model = ShardedDDP(model, self.optimizer)
-            else:
-                mixed_precision = self.args.fp16 or self.args.bf16
-                cpu_offload = ShardedDDPOption.OFFLOAD in self.args.sharded_ddp
-                zero_3 = self.sharded_ddp == ShardedDDPOption.ZERO_DP_3
-                # XXX: Breaking the self.model convention but I see no way around it for now.
-                if ShardedDDPOption.AUTO_WRAP in self.args.sharded_ddp:
-                    model = auto_wrap(model)
-                self.model = model = FullyShardedDDP(
-                    model,
-                    mixed_precision=mixed_precision,
-                    reshard_after_forward=zero_3,
-                    cpu_offload=cpu_offload,
-                ).to(self.args.device)
-        # Distributed training using PyTorch FSDP
-        elif self.fsdp is not None:
-            # PyTorch FSDP!
-            from torch.distributed.fsdp.fully_sharded_data_parallel import CPUOffload
-            from torch.distributed.fsdp.fully_sharded_data_parallel import FullyShardedDataParallel as FSDP
-            from torch.distributed.fsdp.fully_sharded_data_parallel import MixedPrecision
-            from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy, transformer_auto_wrap_policy
-
-            if FSDPOption.OFFLOAD in self.args.fsdp:
-                cpu_offload = CPUOffload(offload_params=True)
-            else:
-                cpu_offload = CPUOffload(offload_params=False)
-
-            auto_wrap_policy = None
-            if FSDPOption.AUTO_WRAP in self.args.fsdp:
-                if self.args.fsdp_min_num_params > 0:
-                    auto_wrap_policy = functools.partial(
-                        size_based_auto_wrap_policy, min_num_params=self.args.fsdp_min_num_params
-                    )
-                elif self.args.fsdp_transformer_layer_cls_to_wrap is not None:
-                    transformer_cls_to_wrap = get_module_class_from_name(
-                        model, self.args.fsdp_transformer_layer_cls_to_wrap
-                    )
-                    if transformer_cls_to_wrap is None:
-                        raise Exception("Could not find the transformer layer class to wrap in the model.")
-                    auto_wrap_policy = functools.partial(
-                        transformer_auto_wrap_policy,
-                        # Transformer layer class to wrap
-                        transformer_layer_cls={transformer_cls_to_wrap},
-                    )
-            mixed_precision_policy = None
-            dtype = None
-            if self.args.fp16:
-                dtype = torch.float16
-            elif self.args.bf16:
-                dtype = torch.bfloat16
-            if dtype is not None:
-                mixed_precision_policy = MixedPrecision(param_dtype=dtype, reduce_dtype=dtype, buffer_dtype=dtype)
-            if type(model) != FSDP:
-                # XXX: Breaking the self.model convention but I see no way around it for now.
-                self.model = model = FSDP(
-                    model,
-                    sharding_strategy=self.fsdp,
-                    cpu_offload=cpu_offload,
-                    auto_wrap_policy=auto_wrap_policy,
-                    mixed_precision=mixed_precision_policy,
-                    device_id=self.args.device,
-                )
-        elif self.args.local_rank != -1:
+        if self.args.local_rank != -1:
             kwargs = {}
             if self.args.ddp_find_unused_parameters is not None:
                 kwargs["find_unused_parameters"] = self.args.ddp_find_unused_parameters
@@ -1271,12 +1108,6 @@ class Trainer:
 
             if args.fp16:
                 self.optimizer.clip_master_grads(args.max_grad_norm)
-            elif hasattr(self.optimizer, "clip_grad_norm"):
-                # Some optimizers (like the sharded optimizer) have a specific way to do gradient clipping
-                self.optimizer.clip_grad_norm(args.max_grad_norm)
-            elif hasattr(model, "clip_grad_norm_"):
-                # Some models (like FullyShardedDDP) have a specific way to do gradient clipping
-                model.clip_grad_norm_(args.max_grad_norm)
             else:
                 # Revert to normal clipping otherwise, handling full precision
                 nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm,)
@@ -1316,11 +1147,6 @@ class Trainer:
         num_train_samples = training_control_vars["num_train_samples"]
         num_update_steps_per_epoch = training_control_vars["num_update_steps_per_epoch"]
 
-        delay_optimizer_creation = (
-            self.sharded_ddp is not None
-            and self.sharded_ddp != ShardedDDPOption.SIMPLE
-            or self.fsdp is not None
-        )
         if args.deepspeed:
             deepspeed_engine, optimizer, lr_scheduler = deepspeed_init(
                 self, num_training_steps=max_steps, resume_from_checkpoint=resume_from_checkpoint
@@ -1330,7 +1156,7 @@ class Trainer:
             self.deepspeed = deepspeed_engine
             self.optimizer = optimizer
             self.lr_scheduler = lr_scheduler
-        elif not delay_optimizer_creation:
+        else:
             self.create_optimizer_and_scheduler(num_training_steps=max_steps)
 
         self.state = TrainerState()
@@ -1348,9 +1174,6 @@ class Trainer:
         # for the rest of this function `model` is the outside model, whether it was wrapped or not
         if model is not self.model:
             self.model_wrapped = model
-
-        if delay_optimizer_creation:
-            self.create_optimizer_and_scheduler(num_training_steps=max_steps)
 
         # Check if saved optimizer or scheduler states exist
         self._load_optimizer_and_scheduler(resume_from_checkpoint)
@@ -1722,8 +1545,7 @@ class Trainer:
                     )
 
     def _save_checkpoint(self, model, trial, metrics=None):
-        # In all cases, including ddp/dp/deepspeed, self.model is always a reference to the model we
-        # want to save except FullyShardedDDP.
+        # In all cases, including ddp/dp/deepspeed, self.model is always a reference to the model we want to save.
         # assert unwrap_model(model) is self.model, "internal model should be a reference to self.model"
 
         # Save model checkpoint
@@ -1739,10 +1561,6 @@ class Trainer:
             # under zero3 model file itself doesn't get saved since it's bogus! Unless deepspeed
             # config `stage3_gather_16bit_weights_on_model_save` is True
             self.deepspeed.save_checkpoint(output_dir)
-
-        # Save optimizer and scheduler
-        if self.sharded_ddp == ShardedDDPOption.SIMPLE:
-            self.optimizer.consolidate_state_dict()
 
         if self.args.should_save and not self.deepspeed:
             # deepspeed.save_checkpoint above saves model/optim/sched
@@ -2075,16 +1893,7 @@ class Trainer:
         if output_dir is None:
             output_dir = self.args.output_dir
 
-        if (
-            ShardedDDPOption.ZERO_DP_2 in self.args.sharded_ddp
-            or ShardedDDPOption.ZERO_DP_3 in self.args.sharded_ddp
-            or self.fsdp is not None
-        ):
-            state_dict = self.model.state_dict()
-
-            if self.args.should_save:
-                self._save(output_dir, state_dict=state_dict)
-        elif self.deepspeed:
+        if self.deepspeed:
             # this takes care of everything as long as we aren't under zero3
             if self.args.should_save:
                 self._save(output_dir)
