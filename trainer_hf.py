@@ -2237,6 +2237,7 @@ class Trainer:
                 if self.preprocess_logits_for_metrics is not None:
                     logits = self.preprocess_logits_for_metrics(logits, labels)
                 preds_host = logits if preds_host is None else nested_concat(preds_host, logits, padding_index=-100)
+
             self.control = self.callback_handler.on_prediction_step(args, self.state, self.control)
 
             # Gather all tensors and put them back on the CPU if we have done enough accumulation steps.
@@ -2245,8 +2246,8 @@ class Trainer:
                     losses = nested_numpify(losses_host)
                     all_losses = losses if all_losses is None else np.concatenate((all_losses, losses), axis=0)
                 if preds_host is not None:
-                    logits = nested_numpify(preds_host)
-                    all_preds = logits if all_preds is None else nested_concat(all_preds, logits, padding_index=-100)
+                    preds = nested_numpify(preds_host)
+                    all_preds = preds if all_preds is None else nested_concat(all_preds, preds, padding_index=-100)
                 if inputs_host is not None:
                     inputs_decode = nested_numpify(inputs_host)
                     all_inputs = (
@@ -2272,8 +2273,8 @@ class Trainer:
             losses = nested_numpify(losses_host)
             all_losses = losses if all_losses is None else np.concatenate((all_losses, losses), axis=0)
         if preds_host is not None:
-            logits = nested_numpify(preds_host)
-            all_preds = logits if all_preds is None else nested_concat(all_preds, logits, padding_index=-100)
+            preds = nested_numpify(preds_host)
+            all_preds = preds if all_preds is None else nested_concat(all_preds, preds, padding_index=-100)
         if inputs_host is not None:
             inputs_decode = nested_numpify(inputs_host)
             all_inputs = (
