@@ -219,6 +219,7 @@ class TrainerMonitor(Trainer):
         return self.optimizer
 
     def _maybe_log_save_evaluate(self, tr_loss, model, trial, epoch, ignore_keys_for_eval):
+        """判断是log, _save_checkpoint还是 evaluate"""
         if self.control.should_log:
             logs: Dict[str, float] = {}
 
