@@ -8,7 +8,9 @@ import math
 import logging
 import time
 import shutil
+import re
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
+from collections import defaultdict
 
 import torch
 import torch.distributed as dist
@@ -217,6 +219,37 @@ class TrainerMonitor(Trainer):
                 print(f"skipped: {skipped/2**20}M params")
 
         return self.optimizer
+
+    def gradient_norm(self, parameters):
+        """L2梯度范数计算"""
+        grad_norm = defaultdict(float)
+        grad_norm['total_norm'] = 0
+
+        if isinstance(parameters, torch.Tensor):
+            parameters = [parameters]
+
+        for name, p in parameters.named_parameters():
+            if p.grad is None:
+                continue
+
+            cur_grad_norm = torch.norm(p.grad.detach(), 2).item()
+            layer_sub_name = re.findall(r'(.*layer.\d+)', name)
+            embeddings_sub_name = re.findall(r'(.*embeddings)', name)
+
+            sub_name = ""
+            if layer_sub_name:
+                sub_name = layer_sub_name[0]
+            elif embeddings_sub_name:
+                sub_name = embeddings_sub_name[0]
+            else:
+                sub_name = name.replace(".weight", "").replace(".bias", "")
+
+            if sub_name:
+                grad_norm[sub_name] = (cur_grad_norm ** 2 + grad_norm[sub_name] ** 2) ** 0.5
+
+            grad_norm['total_norm'] = (cur_grad_norm ** 2 + grad_norm['total_norm'] ** 2) ** 0.5
+
+        return grad_norm
 
     def _maybe_log_save_evaluate(self, tr_loss, model, trial, epoch, ignore_keys_for_eval):
         """判断是log, _save_checkpoint还是 evaluate"""
