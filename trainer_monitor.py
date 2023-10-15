@@ -251,7 +251,7 @@ class TrainerMonitor(Trainer):
 
         return grad_norm
 
-    def _maybe_log_save_evaluate(self, tr_loss, model, trial, epoch, ignore_keys_for_eval):
+    def _maybe_log_save_evaluate(self, tr_loss, model, trial, epoch, ignore_keys_for_eval, grad_norm_dict=None):
         """判断是log, _save_checkpoint还是 evaluate"""
         if self.control.should_log:
             logs: Dict[str, float] = {}
@@ -264,6 +264,9 @@ class TrainerMonitor(Trainer):
 
             logs["loss"] = round(tr_loss_scalar / (self.state.global_step - self._globalstep_last_logged), 4)
             logs["learning_rate"] = self._get_learning_rate()
+
+            if grad_norm_dict is not None:
+                logs.update(grad_norm_dict)
 
             self._total_loss_scalar += tr_loss_scalar
             self._globalstep_last_logged = self.state.global_step
@@ -725,11 +728,14 @@ class TrainerMonitor(Trainer):
                     # Gradient clipping, optimizer step and lr_scheduler step
                     self.grad_clip_scale(args, model)
 
+                    # 计算梯度的L2范数
+                    grad_norm_dict = self.gradient_norm(model)
+
                     model.zero_grad()
                     self.state.global_step += 1
                     self.state.epoch = epoch + step / steps_in_epoch
                     self.control = self.callback_handler.on_step_end(args, self.state, self.control)
-                    self._maybe_log_save_evaluate(tr_loss, model, trial, epoch, ignore_keys_for_eval)
+                    self._maybe_log_save_evaluate(tr_loss, model, trial, epoch, ignore_keys_for_eval, grad_norm_dict)
                 else:
                     self.control = self.callback_handler.on_substep_end(args, self.state, self.control)
 
